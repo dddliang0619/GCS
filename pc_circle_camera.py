@@ -1,4 +1,4 @@
-"""电脑摄像头识别红、绿、蓝圆形物料的圆心，并显示夹取偏差。"""
+"""电脑摄像头红绿蓝实心圆定位；算法位于 pc_circle_vision.py。"""
 
 import argparse
 import json
@@ -8,116 +8,58 @@ from pathlib import Path
 
 import cv2
 
+from pc_circle_vision import (
+    ALIGN_FRAMES, HSV_RANGES, STABLE_FRAMES, CircleTracker,
+    clean_mask, detect_circle, detect_circles, make_mask,
+)
 
 CONFIG_FILE = Path(__file__).with_name("pc_circle_config.json")
 WINDOW = "RGB circle centers | 1 Red 2 Green 3 Blue | C calibrate | M mask | Q quit"
-MASK_WINDOW = "Selected color mask"
-
-# OpenCV HSV: H=0..179, S/V=0..255。现场光照不同，先按 M 检查二值图再调范围。
-HSV_RANGES = {
-    "RED": [((0, 90, 50), (12, 255, 255)),
-            ((170, 90, 50), (179, 255, 255))],
-    "GREEN": [((35, 65, 45), (85, 255, 255))],
-    "BLUE": [((90, 65, 45), (135, 255, 255))],
-}
+MASK_WINDOW = "Selected color mask (raw | cleaned)"
 DRAW_COLORS = {"RED": (0, 0, 255), "GREEN": (0, 255, 0), "BLUE": (255, 0, 0)}
 
-MIN_AREA = 500
-MIN_RADIUS = 14
-MAX_RADIUS = 150
-MIN_CIRCULARITY = 0.65
-MIN_FILL_RATIO = 0.58
-MAX_CENTER_DISAGREEMENT = 0.28  # 色块质心与外接圆圆心相差不得超过半径的此比例
-STABLE_FRAMES = 5
-MAX_CENTER_JUMP = 16
-MAX_RADIUS_JUMP = 10
-SMOOTHING = 0.45
-ALIGN_TOLERANCE_PX = 5
+
+def validate_roi(roi, width, height):
+    if roi is None:
+        return (0, 0, width, height)
+    x, y, w, h = roi
+    if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
+        raise ValueError("ROI must be inside the actual camera frame: %dx%d" % (width, height))
+    return tuple(roi)
 
 
-def load_grab_point():
+def calibration_context(camera_index, width, height, roi):
+    return {"camera": camera_index, "width": width, "height": height, "roi": list(roi)}
+
+
+def load_grab_point(context):
     if not CONFIG_FILE.exists():
         return None
     try:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        return int(data["grab_x"]), int(data["grab_y"])
-    except (OSError, ValueError, KeyError, TypeError):
-        print("Calibration file invalid; starting uncalibrated.")
+        if not isinstance(data, dict) or data.get("version") != 2 or data.get("context") != context:
+            raise ValueError("camera/resolution/ROI changed or legacy calibration")
+        point = data["grab_x"], data["grab_y"]
+        if any(type(value) not in (int, float) or not math.isfinite(value) for value in point):
+            raise ValueError("invalid coordinates")
+        x, y, w, h = context["roi"]
+        if not (x <= point[0] < x + w and y <= point[1] < y + h):
+            raise ValueError("calibration outside ROI")
+        return point
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print("Calibration ignored; press C to recalibrate:", exc)
         return None
 
 
-def save_grab_point(point):
-    CONFIG_FILE.write_text(
-        json.dumps({"grab_x": point[0], "grab_y": point[1]}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+def save_grab_point(point, context):
+    data = {"version": 2, "grab_x": point[0], "grab_y": point[1], "context": context}
+    temporary = CONFIG_FILE.with_suffix(".json.tmp")
+    try:
+        temporary.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        temporary.replace(CONFIG_FILE)
+    finally:
+        temporary.unlink(missing_ok=True)
     print("Saved grab point:", point)
-
-
-def make_mask(hsv, color):
-    mask = None
-    for low, high in HSV_RANGES[color]:
-        part = cv2.inRange(hsv, low, high)
-        mask = part if mask is None else cv2.bitwise_or(mask, part)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    return mask
-
-
-def detect_circle(mask):
-    """从指定颜色的实心圆色块求质心；返回 (x,y,r,score) 或 None。"""
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    best = None
-    best_score = -1.0
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < MIN_AREA:
-            continue
-        (circle_x, circle_y), radius = cv2.minEnclosingCircle(contour)
-        if not MIN_RADIUS <= radius <= MAX_RADIUS:
-            continue
-        perimeter = cv2.arcLength(contour, True)
-        if perimeter <= 0:
-            continue
-        circularity = 4 * math.pi * area / (perimeter * perimeter)
-        fill_ratio = area / (math.pi * radius * radius)
-        if circularity < MIN_CIRCULARITY or fill_ratio < MIN_FILL_RATIO:
-            continue
-        moments = cv2.moments(contour)
-        if moments["m00"] <= 0:
-            continue
-        cx = moments["m10"] / moments["m00"]
-        cy = moments["m01"] / moments["m00"]
-        if math.hypot(cx - circle_x, cy - circle_y) > max(
-            5, MAX_CENTER_DISAGREEMENT * radius
-        ):
-            continue
-        score = area * min(circularity, 1.0) * min(fill_ratio, 1.0)
-        if score > best_score:
-            best = (cx, cy, radius, score)
-            best_score = score
-    return best
-
-
-def update_track(previous, detection):
-    """一帧丢失就复位，防止旧坐标被误用；对有效圆心做轻度平滑。"""
-    if detection is None:
-        return None
-    if previous is None:
-        return (detection[0], detection[1], detection[2], 1)
-    jump = max(abs(detection[0] - previous[0]),
-               abs(detection[1] - previous[1]))
-    radius_jump = abs(detection[2] - previous[2])
-    if jump > MAX_CENTER_JUMP or radius_jump > MAX_RADIUS_JUMP:
-        return (detection[0], detection[1], detection[2], 1)
-    return (
-        SMOOTHING * detection[0] + (1 - SMOOTHING) * previous[0],
-        SMOOTHING * detection[1] + (1 - SMOOTHING) * previous[1],
-        SMOOTHING * detection[2] + (1 - SMOOTHING) * previous[2],
-        min(previous[3] + 1, 999),
-    )
 
 
 def open_camera(index, width, height):
@@ -127,10 +69,7 @@ def open_camera(index, width, height):
         camera = cv2.VideoCapture(index)
     if not camera.isOpened():
         camera.release()
-        raise RuntimeError(
-            "Cannot open camera. Check USB connection/index, close MATLAB or other "
-            "camera apps, and check Windows camera permissions."
-        )
+        raise RuntimeError("Cannot open camera. Check USB/index, camera permissions and other camera apps.")
     camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
@@ -138,104 +77,115 @@ def open_camera(index, width, height):
     return camera
 
 
-def run(camera_index, width, height):
+def run(camera_index, width, height, roi=None):
+    if width <= 0 or height <= 0:
+        raise ValueError("Requested width and height must be positive")
     camera = open_camera(camera_index, width, height)
-    grab_point = load_grab_point()
-    selected = "BLUE"
-    show_mask = False
-    tracks = {color: None for color in HSV_RANGES}
+    selected, show_mask = "BLUE", False
+    trackers = {color: CircleTracker() for color in HSV_RANGES}
+    grab_point = context = frame_size = None
     fps = 0.0
     previous_time = time.perf_counter()
     frame_number = 0
-    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-    print("1=RED 2=GREEN 3=BLUE | C=calibrate selected stable circle | M=mask | R=reset | Q/Esc=quit")
     try:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        print("1/2/3=RED/GREEN/BLUE | C=calibrate | M=raw/clean masks | R=reset | Q/Esc=quit")
         while True:
             ok, frame = camera.read()
             if not ok:
-                print("Camera frame read failed.")
+                print("Camera frame read failed; no current target.")
                 break
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            masks = {color: make_mask(hsv, color) for color in HSV_RANGES}
-            detections = {color: detect_circle(masks[color]) for color in HSV_RANGES}
-            for color in HSV_RANGES:
-                tracks[color] = update_track(tracks[color], detections[color])
-
+            actual_height, actual_width = frame.shape[:2]
+            if frame_size != (actual_width, actual_height):
+                active_roi = validate_roi(roi, actual_width, actual_height)
+                context = calibration_context(camera_index, actual_width, actual_height, active_roi)
+                # 实际分辨率变化后，清空全部历史，不继续使用旧坐标。
+                trackers = {color: CircleTracker() for color in HSV_RANGES}
+                grab_point = load_grab_point(context)
+                frame_size = actual_width, actual_height
+                print("Actual frame:", frame_size, "ROI:", active_roi)
+            x, y, w, h = active_roi
+            hsv = cv2.cvtColor(frame[y:y + h, x:x + w], cv2.COLOR_BGR2HSV)
+            raw_masks = {color: make_mask(hsv, color, clean=False) for color in HSV_RANGES}
+            masks = {color: clean_mask(raw_masks[color]) for color in HSV_RANGES}
+            for color, tracker in trackers.items():
+                candidates = detect_circles(masks[color], raw_masks[color], offset=(x, y))
+                tracker.update(candidates, grab_point)
+            cv2.rectangle(frame, (x, y), (x + w - 1, y + h - 1), (160, 160, 160), 1)
             if grab_point is not None:
-                cv2.drawMarker(frame, grab_point, (255, 255, 255),
+                cv2.drawMarker(frame, tuple(round(v) for v in grab_point), (255, 255, 255),
                                cv2.MARKER_CROSS, 24, 2)
-            for color, target in tracks.items():
-                if target is None:
+            for color, tracker in trackers.items():
+                if tracker.target is None:
                     continue
-                cx, cy, radius = map(int, target[:3])
+                cx, cy, radius = (round(v) for v in tracker.target[:3])
                 ink = DRAW_COLORS[color]
                 cv2.circle(frame, (cx, cy), radius, ink, 2)
                 cv2.drawMarker(frame, (cx, cy), ink, cv2.MARKER_CROSS, 18, 2)
                 cv2.putText(frame, "%s (%d,%d)" % (color, cx, cy),
-                            (max(5, cx - radius), max(20, cy - radius - 7)),
+                            (max(5, cx - radius), max(90, cy - radius - 7)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, ink, 2, cv2.LINE_AA)
-
-            target = tracks[selected]
+            tracker = trackers[selected]
+            target = tracker.target
             if target is None:
                 status = "%s: NO CIRCLE" % selected
             elif grab_point is None:
-                status = "%s: (%.1f, %.1f) - place at grab point, press C" % (
-                    selected, target[0], target[1]
-                )
+                status = "%s: CALIBRATE (%.1f, %.1f) - press C when stable" % (selected, *target[:2])
             else:
-                dx = target[0] - grab_point[0]
-                dy = target[1] - grab_point[1]
-                aligned = (target[3] >= STABLE_FRAMES
-                           and abs(dx) <= ALIGN_TOLERANCE_PX
-                           and abs(dy) <= ALIGN_TOLERANCE_PX)
+                dx, dy = target.cx - grab_point[0], target.cy - grab_point[1]
                 status = "%s: %s dx=%+.1f dy=%+.1f px" % (
-                    selected, "ALIGNED" if aligned else "OFFSET", dx, dy
-                )
-                cv2.line(frame, (int(target[0]), int(target[1])),
-                         grab_point, (0, 255, 255), 1)
-
+                    selected, "ALIGNED" if tracker.aligned else "OFFSET", dx, dy)
+                cv2.line(frame, (round(target.cx), round(target.cy)),
+                         tuple(round(v) for v in grab_point), (0, 255, 255), 1)
             now = time.perf_counter()
-            dt = now - previous_time
-            previous_time = now
+            dt, previous_time = now - previous_time, now
             if dt > 0:
                 fps = 0.85 * fps + 0.15 / dt if fps else 1 / dt
-            cv2.rectangle(frame, (0, 0), (frame.shape[1], 68), (0, 0, 0), -1)
+            cv2.rectangle(frame, (0, 0), (actual_width, 68), (0, 0, 0), -1)
             cv2.putText(frame, status, (10, 27), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.62, DRAW_COLORS[selected], 2, cv2.LINE_AA)
-            cv2.putText(frame, "FPS %.1f | stable %d | 1 RED 2 GREEN 3 BLUE | M mask" %
-                        (fps, target[3] if target else 0), (10, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255),
-                        1, cv2.LINE_AA)
+                        0.55, DRAW_COLORS[selected], 1, cv2.LINE_AA)
+            info = "FPS %.1f | stable %s | align %d/%d | M mask" % (
+                fps, "YES" if tracker.stable else "NO", tracker.align_count, ALIGN_FRAMES)
+            cv2.putText(frame, info, (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.imshow(WINDOW, frame)
             if show_mask:
-                cv2.imshow(MASK_WINDOW, masks[selected])
-
+                cv2.imshow(MASK_WINDOW, cv2.hconcat([raw_masks[selected], masks[selected]]))
             frame_number += 1
             if frame_number % 10 == 0:
-                summary = ["%s:%s" % (color, "-" if tracks[color] is None else
-                           "(%.1f,%.1f)" % tracks[color][:2])
-                           for color in HSV_RANGES]
-                print(" ".join(summary), "selected=", selected,
+                print(status, "stable=", tracker.stable, "align=", tracker.align_count,
                       "fps=%.1f" % fps)
-
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
             if key in (ord("1"), ord("2"), ord("3")):
-                selected = {ord("1"): "RED", ord("2"): "GREEN",
-                            ord("3"): "BLUE"}[key]
+                selected = {ord("1"): "RED", ord("2"): "GREEN", ord("3"): "BLUE"}[key]
+                for item in trackers.values():
+                    item.reset_alignment()
             if key == ord("c"):
-                target = tracks[selected]
-                if target is not None and target[3] >= STABLE_FRAMES:
-                    grab_point = round(target[0]), round(target[1])
-                    save_grab_point(grab_point)
+                tracker = trackers[selected]
+                if tracker.target is not None and tracker.stable:
+                    # 标定使用最近原始检测的均值，避免沿用滞后的平滑坐标。
+                    point = tuple(sum(item[i] for item in tracker.history) / len(tracker.history)
+                                  for i in (0, 1))
+                    try:
+                        save_grab_point(point, context)
+                    except OSError as exc:
+                        print("Calibration save failed:", exc)
+                    else:
+                        grab_point = point
+                        for item in trackers.values():
+                            item.reset_alignment()
                 else:
-                    print("Wait for the selected color circle to stabilize for 5 frames.")
+                    print("Keep the selected circle still for at least %d frames." % STABLE_FRAMES)
             if key == ord("r"):
                 grab_point = None
-                if CONFIG_FILE.exists():
-                    CONFIG_FILE.unlink()
-                print("Grab point reset.")
+                for item in trackers.values():
+                    item.reset_alignment()
+                try:
+                    CONFIG_FILE.unlink(missing_ok=True)
+                except OSError as exc:
+                    print("Calibration cleared in memory; file removal failed:", exc)
             if key == ord("m"):
                 show_mask = not show_mask
                 if not show_mask:
@@ -247,9 +197,11 @@ def run(camera_index, width, height):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Detect red/green/blue circle centers")
-    parser.add_argument("--camera", type=int, default=0, help="camera index, default 0")
+    parser = argparse.ArgumentParser(description="Detect red/green/blue solid circle centers")
+    parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--roi", type=int, nargs=4, metavar=("X", "Y", "W", "H"),
+                        help="Search region in actual frame pixels; default is full frame")
     args = parser.parse_args()
-    run(args.camera, args.width, args.height)
+    run(args.camera, args.width, args.height, args.roi)

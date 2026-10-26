@@ -22,3 +22,6 @@ Thumbs.db
 # MATLAB temporary files
 *.asv
 *.m~
+
+pc_circle_config.json.tmp
+.circle-test-*/
