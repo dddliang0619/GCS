@@ -1,0 +1,24 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local calibration and secrets
+pc_circle_config.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor and operating system files
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# MATLAB temporary files
+*.asv
+*.m~

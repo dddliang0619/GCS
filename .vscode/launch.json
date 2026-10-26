@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "电脑摄像头：圆心识别",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/pc_circle_camera.py",
+      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
